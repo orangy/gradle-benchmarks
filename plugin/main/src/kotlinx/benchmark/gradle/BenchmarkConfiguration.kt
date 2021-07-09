@@ -9,6 +9,8 @@ open class BenchmarkConfiguration(val extension: BenchmarksExtension, val name: 
     var iterationTime: Long? = null
     var iterationTimeUnit: String? = null
     var mode: String? = null
+    var nativeIterationMode: String? = null // TODO: where should warning about K/N specific of this parameter be shown?
+    var nativeGCCollectMode: String? = null
     var outputTimeUnit: String? = null
     var reportFormat: String? = null
 

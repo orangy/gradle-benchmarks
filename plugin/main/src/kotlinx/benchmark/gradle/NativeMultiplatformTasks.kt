@@ -4,7 +4,9 @@ import org.gradle.api.*
 import org.gradle.api.tasks.*
 import org.jetbrains.kotlin.gradle.plugin.mpp.*
 import org.jetbrains.kotlin.konan.target.*
-import java.io.*
+import java.io.File
+import kotlin.io.path.ExperimentalPathApi
+import kotlin.io.path.createTempFile
 
 fun Project.processNativeCompilation(target: NativeBenchmarkTarget) {
     val compilation = target.compilation
@@ -114,28 +116,133 @@ fun Project.createNativeBenchmarkExecTask(
         onlyIf { linkTask.enabled }
 
         val reportsDir = benchmarkReportsDir(config, target)
-        val reportFile = reportsDir.resolve("${target.name}.${config.reportFileExt()}")
+        reportFile = reportsDir.resolve("${target.name}.json")
 
         val executableFile = linkTask.outputFile.get()
         executable = executableFile.absolutePath
-        if (target.workingDir != null)
-            workingDir = File(target.workingDir)
+        this.config = config
+        this.workingDir = target.workingDir?.let { File(it) }
 
         onlyIf { executableFile.exists() }
+        benchsDescriptionDir = file(project.buildDir.resolve(target.extension.benchsDescriptionDir).resolve(config.name))
+        benchsDescriptionDir.mkdirs()
+
+        val ideaActive = (extensions.extraProperties.get("idea.internal.test") as? String)?.toBoolean() ?: false
+        configFile = writeParameters(target.name, reportFile, if (ideaActive) "xml" else "text", config)
 
         dependsOn(linkTask)
         doFirst {
-            val ideaActive = (extensions.extraProperties.get("idea.internal.test") as? String)?.toBoolean() ?: false
-            args(writeParameters(target.name, reportFile, if (ideaActive) "xml" else "text", config))
             reportsDir.mkdirs()
             logger.lifecycle("Running '${config.name}' benchmarks for '${target.name}'")
         }
     }
 }
 
-open class NativeBenchmarkExec : Exec() {
+open class NativeBenchmarkExec() : DefaultTask() {
 /*
     @Option(option = "filter", description = "Configures the filter for benchmarks to run.")
     var filter: String? = null
 */
+    @Input
+    lateinit var executable: String
+
+    var workingDir: File? = null
+
+    @Input
+    lateinit var configFile: File
+
+    @Input
+    lateinit var config: BenchmarkConfiguration
+
+    @Input
+    lateinit var reportFile: File
+
+    @Input
+    lateinit var benchsDescriptionDir: File
+
+    private fun execute(args: Collection<String>) {
+        project.exec {
+            it.executable = executable
+            it.args(args)
+            if (workingDir != null)
+                it.workingDir = workingDir
+        }
+    }
+
+    @ExperimentalPathApi
+    @TaskAction
+    fun run() {
+        // Get full list of running benchmarks
+        execute(listOf(configFile.absolutePath, "--list", benchsDescriptionDir.absolutePath))
+        val detailedConfigFiles = project.fileTree(benchsDescriptionDir).files.sortedBy { it.absolutePath }
+        val jsonReportParts = mutableListOf<File>()
+        val runResults = mutableMapOf<String, String>()
+
+        detailedConfigFiles.forEach { runConfig ->
+            val runConfigPath = runConfig.absolutePath
+            val lines = runConfig.readLines()
+            require(lines.size > 1) { "Wrong detailed configuration format" }
+            val currentConfigDescription = lines[1]
+
+            // Execute benchmark
+            if (config.nativeIterationMode == "internal") {
+                val suiteResultsFile = createTempFile("bench", ".txt").toFile()
+                execute(listOf(configFile.absolutePath, "--internal", runConfigPath, suiteResultsFile.absolutePath))
+                val suiteResults = suiteResultsFile.readText()
+                if (suiteResults.isNotEmpty())
+                    runResults[runConfigPath] = suiteResults
+            } else {
+                val iterations = currentConfigDescription.substringAfter("iterations=")
+                    .substringBefore(',').toInt()
+                val warmups = currentConfigDescription.substringAfter("warmups=")
+                    .substringBefore(',').toInt()
+                // Warm up
+                var exceptionDuringExecution = false
+                var textResult: File? = null
+                for (i in 0 until warmups) {
+                    textResult = createTempFile("bench", ".txt").toFile()
+                    execute(listOf(configFile.absolutePath, "--warmup", runConfigPath, i.toString(), textResult.absolutePath))
+                    val result = textResult.readLines().getOrNull(0)
+                    if (result == "null") {
+                        exceptionDuringExecution = true
+                        break
+                    }
+                }
+                // Get cycles number
+                val cycles = if (!exceptionDuringExecution && textResult != null) textResult.readText() else "1"
+                // Execution
+                val iterationResults = mutableListOf<Double>()
+                var iteration = 0
+                while (!exceptionDuringExecution && iteration in 0 until iterations) {
+                    val textResult = createTempFile("bench", ".txt").toFile()
+                    execute(
+                        listOf(configFile.absolutePath, "--iteration", runConfigPath, iteration.toString(),
+                            cycles, textResult.absolutePath)
+                    )
+                    val result = textResult.readLines()[0]
+                    if (result == "null")
+                        exceptionDuringExecution = true
+                    iterationResults.add(result.toDouble())
+                    iteration++
+                }
+                // Store results
+                if (iterationResults.size == iterations) {
+                    val iterationsResultsFile = createTempFile("bench_results").toFile()
+                    iterationsResultsFile.printWriter().use { out ->
+                        out.write(iterationResults.joinToString { it.toString() })
+                    }
+                    execute(
+                        listOf(configFile.absolutePath, "--end-run", runConfigPath, iterationsResultsFile.absolutePath)
+                    )
+                    runResults[runConfigPath] = iterationResults.joinToString()
+                }
+            }
+        }
+        // Merge results
+        val samplesFile = createTempFile("bench_results").toFile()
+        samplesFile.printWriter().use { out ->
+            out.write(runResults.toList().joinToString("\n") { "${it.first}: ${it.second}"})
+        }
+        execute(listOf(configFile.absolutePath, "--store-results", samplesFile.absolutePath))
+    }
 }
